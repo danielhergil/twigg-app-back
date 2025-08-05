@@ -76,9 +76,9 @@ async def call_model_single(prompt: str, max_tokens: int = 1200) -> str:
     except Exception:
         return ""
 
-async def generate_outline_attempt(prompt: str) -> str:
+async def generate_outline_attempt(prompt: str, max_tokens: int = 1200) -> str:
     try:
-        return await call_model_single(prompt, max_tokens=1200)
+        return await call_model_single(prompt, max_tokens=max_tokens)
     except Exception as e:
         print(f"[ai_generator] error en outline attempt: {e}")
         return ""
@@ -182,6 +182,18 @@ Devuélveme únicamente un JSON válido similar a este ejemplo (sin texto explic
         outline = build_fallback_outline(duration_weeks)
         print(f"[ai_generator] fallback outline usado, raw último: {raw[:800]}")
     return outline
+
+# Nueva función para generar outline temporal (sin persistir)
+async def generate_outline_temporary(
+    course_title: str,
+    level: str,
+    duration_weeks: int,
+    description: str,
+) -> dict:
+    """
+    Genera outline temporal sin persistir en base de datos
+    """
+    return await generate_outline(course_title, level, duration_weeks, description)
 
 async def expand_lesson(
     course_title: str,

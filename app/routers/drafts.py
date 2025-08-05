@@ -1,17 +1,17 @@
+# app/routers/drafts.py
 from fastapi import APIRouter, Depends, HTTPException, Path, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from typing import Any
 from ..models import CourseDraftRequest, CourseDraftUpdateRequest, PublishDraftRequest
 from ..dependencies import get_current_user
 from ..firebase_client import db
-from ..ai_generator import generate_outline, expand_module
+from ..ai_generator import generate_outline, expand_module, generate_outline_temporary
 from datetime import datetime
 import uuid
 import json
 from ..utils import slugify
 
 router = APIRouter(tags=["drafts"])
-
 
 async def expand_and_persist_full_draft(
     draft_id: str,
@@ -43,7 +43,6 @@ async def expand_and_persist_full_draft(
                 "modules": partial_modules,
                 "updatedAt": datetime.utcnow(),
             })
-
         # Guardar versión final
         draft_ref.update({
             "modules": expanded_modules,
@@ -58,7 +57,6 @@ async def expand_and_persist_full_draft(
         })
         print("[expand_and_persist_full_draft] error:", e)
 
-
 @router.post("/generate-draft")
 async def generate_draft(
     request: CourseDraftRequest,
@@ -68,7 +66,6 @@ async def generate_draft(
     uid = auth_data["uid"]
     draft_id = str(uuid.uuid4())
     draft_ref = db.collection("drafts").document(draft_id)
-
     # Generar outline inicial
     outline = await generate_outline(
         course_title=request.courseTitle,
@@ -77,7 +74,6 @@ async def generate_draft(
         description=request.description,
     )
     initial_modules = outline.get("modules", [])
-
     # Crear draft inicial en estado "generating"
     draft_ref.set({
         "courseTitle": request.courseTitle,
@@ -90,7 +86,6 @@ async def generate_draft(
         "updatedAt": datetime.utcnow(),
         "status": "generating",
     })
-
     # Lanzar expansión en background
     background_tasks.add_task(
         expand_and_persist_full_draft,
@@ -98,7 +93,6 @@ async def generate_draft(
         request,
         uid,
     )
-
     return {
         "draftId": draft_id,
         "draft": {
@@ -113,7 +107,6 @@ async def generate_draft(
         },
     }
 
-
 # Streaming por módulos (SSE) con persistencia incremental
 @router.post("/generate-draft-stream")
 async def generate_draft_stream(
@@ -121,7 +114,6 @@ async def generate_draft_stream(
     auth_data: dict = Depends(get_current_user),
 ):
     uid = auth_data["uid"]
-
     async def event_generator():
         draft_id = str(uuid.uuid4())
         draft_ref = db.collection("drafts").document(draft_id)
@@ -133,7 +125,6 @@ async def generate_draft_stream(
                 duration_weeks=request.durationWeeks,
                 description=request.description,
             )
-
             # Inicializar draft parcial en Firestore
             initial_modules = outline.get("modules", [])
             draft_ref.set({
@@ -147,10 +138,8 @@ async def generate_draft_stream(
                 "updatedAt": datetime.utcnow(),
                 "status": "generating",
             })
-
             # Emitir outline inicial
             yield f"event: outline\ndata: {json.dumps({'outline': outline})}\n\n"
-
             expanded_modules = []
             for idx, module in enumerate(outline.get("modules", [])):
                 expanded_module = await expand_module(
@@ -161,17 +150,14 @@ async def generate_draft_stream(
                     module,
                 )
                 expanded_modules.append(expanded_module)
-
                 # Actualizar parcialmente en Firestore
                 partial_modules = expanded_modules + outline.get("modules", [])[len(expanded_modules):]
                 draft_ref.update({
                     "modules": partial_modules,
                     "updatedAt": datetime.utcnow(),
                 })
-
                 # Emitir módulo completado
                 yield f"event: module\ndata: {json.dumps({'module': expanded_module, 'index': idx})}\n\n"
-
             # 3. Construir draft final
             draft_data = {
                 "id": draft_id,
@@ -185,21 +171,69 @@ async def generate_draft_stream(
                 "createdAt": datetime.utcnow().isoformat(),
                 "updatedAt": datetime.utcnow().isoformat(),
             }
-
             draft_ref.update({
                 "modules": expanded_modules,
                 "updatedAt": datetime.utcnow(),
                 "status": "draft",
             })
-
             yield f"event: done\ndata: {json.dumps({'draftId': draft_id, 'draft': draft_data})}\n\n"
         except Exception as e:
             error_payload = {"error": str(e)}
             # No se actualiza el status para preservar parcial
             yield f"event: error\ndata: {json.dumps(error_payload)}\n\n"
-
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
+# Nuevo endpoint para generación temporal sin persistir en DB
+@router.post("/generate-draft-stream-temp")
+async def generate_draft_stream_temp(
+    request: CourseDraftRequest,
+    auth_data: dict = Depends(get_current_user),
+):
+    """
+    Genera curso en streaming temporal sin persistir en base de datos
+    """
+    async def event_generator():
+        try:
+            # 1. Generar outline inicial (temporal)
+            outline = await generate_outline_temporary(
+                course_title=request.courseTitle,
+                level=request.level,
+                duration_weeks=request.durationWeeks,
+                description=request.description,
+            )
+            
+            # Emitir outline inicial
+            yield f"event: outline\ndata: {json.dumps({'outline': outline})}\n\n"
+            
+            expanded_modules = []
+            for idx, module in enumerate(outline.get("modules", [])):
+                expanded_module = await expand_module(
+                    request.courseTitle,
+                    request.level,
+                    request.durationWeeks,
+                    request.description,
+                    module,
+                )
+                expanded_modules.append(expanded_module)
+                # Emitir módulo completado
+                yield f"event: module\ndata: {json.dumps({'module': expanded_module, 'index': idx})}\n\n"
+            
+            # 3. Construir draft final temporal
+            draft_data = {
+                "courseTitle": request.courseTitle,
+                "level": request.level,
+                "durationWeeks": request.durationWeeks,
+                "description": request.description,
+                "modules": expanded_modules,
+                "status": "draft",
+            }
+            
+            yield f"event: done\ndata: {json.dumps({'draft': draft_data})}\n\n"
+        except Exception as e:
+            error_payload = {"error": str(e)}
+            yield f"event: error\ndata: {json.dumps(error_payload)}\n\n"
+    
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 # Nuevo: endpoint para consultar progreso (polling)
 @router.get("/drafts/{draft_id}/progress")
@@ -214,7 +248,6 @@ async def draft_progress(
     data = doc.to_dict()
     data["id"] = draft_id
     return {"draft": data}
-
 
 # Actualización de draft parcial
 @router.patch("/drafts/{draft_id}")
@@ -233,7 +266,6 @@ async def update_draft(
         raise HTTPException(status_code=403, detail="No tienes permiso sobre este draft")
     if data.get("status") != "draft":
         raise HTTPException(status_code=400, detail="Solo se pueden editar drafts no publicados")
-
     updates: dict[str, Any] = {}
     if update.courseTitle is not None:
         updates["courseTitle"] = update.courseTitle
@@ -245,22 +277,19 @@ async def update_draft(
         updates["description"] = update.description
     if update.modules is not None:
         updates["modules"] = [m.dict() for m in update.modules]
-
     if not updates:
         raise HTTPException(status_code=400, detail="Nada que actualizar")
-
     updates["updatedAt"] = datetime.utcnow()
     draft_ref.update(updates)
     updated = draft_ref.get().to_dict()
     updated["id"] = draft_id
     return {"draft": updated}
 
-
 @router.post("/publish-draft/{draft_id}")
 async def publish_draft(
-    draft_id: str = Path(...),
-    body: PublishDraftRequest = Depends(),
-    auth_data: dict = Depends(get_current_user),
+    draft_id: str = Path(...), # ID del draft desde la ruta
+    request_data: PublishDraftRequest = None, # <-- Corrección: Usar ':' y un nombre claro
+    auth_data: dict = Depends(get_current_user), # <-- Corrección: Usar ':' aquí también
 ):
     uid = auth_data["uid"]
     draft_ref = db.collection("drafts").document(draft_id)
@@ -275,6 +304,7 @@ async def publish_draft(
 
     course_id = str(uuid.uuid4())
     course_ref = db.collection("courses").document(course_id)
+    # Usar request_data.thumbnail
     course_ref.set({
         "courseTitle": draft.get("courseTitle"),
         "level": draft.get("level"),
@@ -284,11 +314,10 @@ async def publish_draft(
         "rating": 0.0,
         "reviewCount": 0,
         "enrolledCount": 0,
-        "thumbnail": body.thumbnail or "",
+        "thumbnail": request_data.thumbnail if request_data else "", # <-- Acceder correctamente
         "createdBy": uid,
         "createdAt": datetime.utcnow(),
     })
-
     modules = draft.get("modules", [])
     for module in modules:
         module_id = str(module.get("moduleNumber", uuid.uuid4()))
@@ -298,7 +327,6 @@ async def publish_draft(
             "moduleTitle": module.get("moduleTitle"),
             "weeks": module.get("weeks", []),
         })
-
         for topic in module.get("topics", []):
             raw_topic_title = topic.get("topicTitle", "")
             topic_id = slugify(raw_topic_title)
@@ -306,7 +334,6 @@ async def publish_draft(
             topic_ref.set({
                 "topicTitle": raw_topic_title,
             })
-
             for lesson in topic.get("lessons", []):
                 raw_lesson_title = lesson.get("lessonTitle", "")
                 lesson_id = slugify(raw_lesson_title)
@@ -316,7 +343,6 @@ async def publish_draft(
                     "theory": lesson.get("theory"),
                     "tests": lesson.get("tests", []),
                 })
-
     draft_ref.update({
         "status": "published",
         "publishedAt": datetime.utcnow(),
